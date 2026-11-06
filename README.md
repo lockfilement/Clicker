@@ -2,8 +2,8 @@
 
 Autoclicker oficial del servidor **AstralMC** (`Astralmc.cc`) para Minecraft Java en Windows.
 
-🌐 **Página:** https://oldversion24.github.io/AstralMC-Clicker/
-⬇️ **Descarga:** [AstralClicker.exe](https://github.com/OldVersion24/AstralMC-Clicker/releases/latest/download/AstralClicker.exe)
+🌐 **Página:** https://lockfilement.github.io/Clicker/
+⬇️ **Descarga:** [AstralClicker.exe](https://github.com/lockfilement/Clicker/releases/latest/download/AstralClicker.exe)
 
 ## Qué hace (y qué no)
 
@@ -39,9 +39,3 @@ Compilarlo tú mismo (MinGW-w64 / MSYS2 UCRT64):
 ```bash
 g++ -std=c++17 -O2 -s -municode -mwindows -static -static-libgcc -static-libstdc++ AstralMC_Clicker.cpp -o AstralClicker.exe -lcomctl32 -lwinmm -luxtheme -lgdiplus -luser32 -lgdi32
 ```
-
-## Créditos
-
-Programa creado por el staff de AstralMC ([Yinoff/Clicker4Astral](https://github.com/Yinoff/Clicker4Astral)).
-
-⚠️ Descárgalo solo desde este repositorio o el original. Copias de otros sitios pueden estar modificadas.
