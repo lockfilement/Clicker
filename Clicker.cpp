@@ -53,11 +53,12 @@ enum { ID_CPS = 1 };
 struct SliderData { int minimum; int maximum; int value; bool dragging; };
 SliderData g_cpsData{10, 160, 155, false};   // 1.0 - 16.0 CPS (defecto 15.5)
 
-// Limites impuestos por los owners
+// Limites
 constexpr double kMaxCps = 16.0;               // CPS instantaneos nunca por encima de 16
 constexpr size_t kMaxClicksPerSecond = 16;     // y como maximo 16 clics en cualquier ventana de 1 s
 
 std::atomic<bool> g_enabled{ false };
+std::atomic<bool> g_clickInventory{ true };
 std::atomic<bool> g_binding{ false };
 std::atomic<bool> g_running{ true };
 std::atomic<bool> g_lmbHeld{ false };
@@ -145,13 +146,11 @@ LRESULT CALLBACK MouseProc(int n, WPARAM w, LPARAM l) {
     return CallNextHookEx(g_mouseHook, n, w, l);
 }
 
-// Reconoce Minecraft por el titulo o por el proceso javaw.exe.
+// Reconoce Minecraft por clase de ventana o por el proceso javaw.exe / java.exe.
 bool MinecraftFocused() {
     HWND fg = GetForegroundWindow();
     if (!fg) return false;
 
-    // Ventana de juego de Minecraft: LWJGL 2 (1.8.9) o GLFW (versiones nuevas).
-    // No se usa el titulo: un navegador o un chat con "Minecraft" en el titulo no cuenta.
     wchar_t cls[64]{};
     GetClassNameW(fg, cls, static_cast<int>(std::size(cls)));
     if (wcscmp(cls, L"LWJGL") == 0 || wcsncmp(cls, L"GLFW", 4) == 0) return true;
@@ -181,8 +180,7 @@ long long NowMs() {
         Clock::now().time_since_epoch()).count();
 }
 
-// Temporizador de alta resolucion. No depende de timeBeginPeriod, que Windows 11
-// ignora cuando la ventana del programa queda tapada por Minecraft.
+// Temporizador de alta resolucion.
 class PreciseTimer {
 public:
     PreciseTimer() {
@@ -193,8 +191,6 @@ public:
     PreciseTimer(const PreciseTimer&) = delete;
     PreciseTimer& operator=(const PreciseTimer&) = delete;
 
-    // Duerme hasta t. Con spinTail, los ultimos ~1.2 ms se esperan activamente
-    // para clavar el instante del clic.
     void SleepUntil(Clock::time_point t, bool spinTail = true) {
         const auto tail = spinTail ? std::chrono::microseconds(1200) : std::chrono::microseconds(0);
         const auto remaining = t - Clock::now();
@@ -213,20 +209,13 @@ private:
     HANDLE h_ = nullptr;
 };
 
-// Aproxima si una GUI esta abierta comprobando el modo de raton de Minecraft.
-// Con el raton capturado, Minecraft recoloca el cursor en el centro de la ventana
-// en cada frame. Solo se considera GUI abierta si el cursor lleva mas de
-// GUI_GRACE_MS sin pasar por el centro.
 constexpr long long GUI_GRACE_MS = 60;
 std::atomic<long long> g_lastInGameMs{ 0 };
-
-// Senal rapida para 1.8.9 (LWJGL 2): jugando, Minecraft pone un cursor transparente
-// propio; con una GUI abierta vuelve a un cursor estandar de Windows.
 std::atomic<bool> g_cursorStd{ false };
 std::atomic<bool> g_cursorSignalValid{ false };
 
 bool IsStandardCursor(HCURSOR c) {
-    if (!c) return true;   // sin cursor propio: no es el transparente de juego
+    if (!c) return true;
     static const HCURSOR std_[] = {
         LoadCursorW(nullptr, IDC_ARROW),  LoadCursorW(nullptr, IDC_IBEAM),
         LoadCursorW(nullptr, IDC_HAND),   LoadCursorW(nullptr, IDC_WAIT),
@@ -238,8 +227,8 @@ bool IsStandardCursor(HCURSOR c) {
 }
 
 bool GuiOpen() {
-    if (g_cursorSignalValid.load() && g_cursorStd.load()) return true;   // instantaneo
-    return NowMs() - g_lastInGameMs.load() > GUI_GRACE_MS;               // respaldo
+    if (g_cursorSignalValid.load() && g_cursorStd.load()) return true;
+    return NowMs() - g_lastInGameMs.load() > GUI_GRACE_MS;
 }
 
 void GuiMonitor() {
@@ -251,7 +240,6 @@ void GuiMonitor() {
     auto tick = Clock::now();
     g_lastInGameMs.store(NowMs());
 
-    // Seguimiento del slot de la hotbar: teclas 1-9 y rueda del raton, solo jugando.
     bool prevNum[9]{};
     int wheelRemainder = 0;
 
@@ -279,12 +267,14 @@ void GuiMonitor() {
         if (focused) {
             CURSORINFO ci{};
             ci.cbSize = sizeof(ci);
-            if (GetCursorInfo(&ci)) stdCursor = IsStandardCursor(ci.hCursor);
+            if (GetCursorInfo(&ci)) {
+                const bool visible = (ci.flags & CURSOR_SHOWING) != 0;
+                stdCursor = visible && IsStandardCursor(ci.hCursor);
+            }
             if (centered && !stdCursor) g_cursorSignalValid.store(true);
         }
         g_cursorStd.store(stdCursor);
 
-        // Sin Minecraft enfocado no hay GUI que bloquear.
         if (!focused || centered) g_lastInGameMs.store(NowMs());
 
         // ---- Slot de la hotbar ----
@@ -293,7 +283,6 @@ void GuiMonitor() {
         int slot = g_slot.load();
         const int before = slot;
         if (inGame) {
-            // Rueda hacia abajo = slot siguiente (como en Minecraft).
             wheelRemainder += wheel;
             while (wheelRemainder <= -WHEEL_DELTA) { slot = (slot + 1) % 9; wheelRemainder += WHEEL_DELTA; }
             while (wheelRemainder >=  WHEEL_DELTA) { slot = (slot + 8) % 9; wheelRemainder -= WHEEL_DELTA; }
@@ -464,12 +453,16 @@ void Worker() {
         }
         trim(clock::now());
 
-        // Solo se puede clicar jugando: nunca en menus, inventarios, cofres, aldeanos...
-        // y solo con un slot de la hotbar permitido.
-        const bool menuBlocked = g_pressInMenu.load() || GuiOpen();
-        const bool canClick = g_enabled.load() && held && SlotAllowed() &&
-                              MinecraftFocused() && !menuBlocked;
-        if (!canClick) {
+        auto canClickNow = [&](bool isHeld) {
+            if (!g_enabled.load() || !isHeld || !MinecraftFocused()) return false;
+            const bool gui = GuiOpen();
+            const bool inMenu = g_pressInMenu.load() || gui;
+            if (!g_clickInventory.load() && inMenu) return false;
+            if (!(g_clickInventory.load() && gui) && !SlotAllowed()) return false;
+            return true;
+        };
+
+        if (!canClickNow(held)) {
             wasActive = false;
             timer.SleepUntil(clock::now() + std::chrono::milliseconds(2), false);
             continue;
@@ -490,7 +483,7 @@ void Worker() {
         auto now = clock::now();
         if (now < next) {
             timer.SleepUntil(next);
-            if (!g_lmbHeld.load() || !g_enabled.load() || GuiOpen() || !SlotAllowed()) continue;
+            if (!canClickNow(g_lmbHeld.load())) continue;
         }
 
         // Limite duro: nunca mas de 16 clics (contando el fisico) en cualquier ventana de 1 s
@@ -500,7 +493,7 @@ void Worker() {
             continue;
         }
 
-        if (!g_lmbHeld.load() || !g_enabled.load() || GuiOpen() || !SlotAllowed()) continue;
+        if (!canClickNow(g_lmbHeld.load())) continue;
 
         const auto clickStart = clock::now();
         std::uniform_int_distribution<int> hold(8, 16);
@@ -578,14 +571,13 @@ void PaintMain(HWND h, HDC dc) {
     wchar_t cps[16]{}; swprintf_s(cps, L"%.1f", g_cpsX10.load() / 10.0);
     DrawLabel(dc, cps, kRcCpsLabel, g_fLabel, COL_PURPLE_LIGHT, DT_RIGHT);
 
-    DrawCheckbox(dc, g, kRcInventory, L"Click on inventory", false);
+    DrawCheckbox(dc, g, kRcInventory, L"Click on inventory", g_clickInventory.load());
 
     DrawLabel(dc, L"Whitelisted hotbar slots", kRcSlotsLbl, g_fLabel, COL_TEXT);
     const int mask = g_slotMask.load(), cur = g_slot.load();
     for (int i = 0; i < 9; ++i) {
         const RECT r = SlotRect(i);
         const bool on = (mask >> i) & 1;
-        // Casilla con tick: morada y marcada = activa; vacia y gris = desactivada.
         const float s = 22.0f;
         const float x0 = r.left + (kSlotSize - s) / 2.0f, y0 = r.top + 0.5f;
         Gp::RectF sq(x0, y0, s, s);
@@ -604,7 +596,6 @@ void PaintMain(HWND h, HDC dc) {
             Gp::Pen pen(GdipColor(RGB(88, 84, 104)), 1.5f);
             g.DrawPath(&pen, &p);
         }
-        // Slot que tienes en la mano: rayita blanca debajo.
         if (i == cur) {
             Gp::SolidBrush mark(GdipColor(RGB(255, 255, 255)));
             g.FillRectangle(&mark, x0 + 5.0f, y0 + s + 4.0f, s - 10.0f, 2.5f);
@@ -691,11 +682,8 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
             g_enabled.store(!g_enabled.load());
             Redraw();
         } else if (InRect(kRcInventory, x, y)) {
-            // Politica del servidor: no se permite autoclick en inventarios (refill = baneable).
-            MessageBoxW(h,
-                L"Autoclicker for click on inventory is not allowed on AstralMC.\n"
-                L"Just for PvP.",
-                L"AstralMC", MB_ICONWARNING | MB_OK);
+            g_clickInventory.store(!g_clickInventory.load());
+            Redraw();
         } else if (InRect(kRcBind, x, y)) {
             g_binding.store(true);
             Redraw();
@@ -805,7 +793,7 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE, PWSTR, int show) {
     BOOL result;
     while ((result = GetMessageW(&msg, nullptr, 0, 0)) > 0) {
         TranslateMessage(&msg);
-        DispatchMessageW(&msg);
+        DispatchMessage(&msg);
     }
 
     g_running.store(false);
